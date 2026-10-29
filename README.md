@@ -1,8 +1,12 @@
-# Lagrange: a small Slurm cluster for CPU, NVIDIA, and Hailo workloads
+# Guerrilla Cluster: boot idle laptops into Slurm compute nodes
 
-This repository documents and configures a two-machine Slurm cluster built from ordinary Dell laptops. The controller also runs jobs. The compute node exposes its CPU, NVIDIA GPU, and ASUS Hailo-10H AI accelerator to scheduled jobs.
+Guerrilla Cluster is a practical kit for putting idle laptops to work: prepare a bootable USB system drive, plug it into a laptop, boot Linux, connect it to the cluster network, and schedule jobs. It is meant for assembling useful compute from available machines without first building a conventional server rack.
 
-The Hailo-10H is sometimes called a TPU in this project, but it is a Hailo AI accelerator; its software stack is different from NVIDIA CUDA. In this setup, Windows did not provide a usable driver/runtime path for the Hailo card. WSL could not see the PCIe device either. We therefore boot the compute machine into native Debian Linux from a USB disk, where the Linux kernel driver, firmware, and HailoRT can access it.
+The USB drive contains a provisioned Debian system, not just an installer. In this workflow the laptop boots and runs from that external drive; the image-writing step targets the USB device, not the laptop's internal disk. A 100 GiB image is used in the tested setup, so the USB drive must be large enough. Performance and reliability depend on the USB device.
+
+This repository is the tested configuration for one small cluster, not yet a universal one-click node builder. It documents the image build, Slurm controller, shared storage, and node-join steps, then explains what must change to adapt them to other laptops.
+
+The tested compute node exposes its CPU, NVIDIA GPU, and ASUS Hailo-10H AI accelerator to Slurm jobs. The Hailo-10H is sometimes called a TPU here, but it is a Hailo AI accelerator with a software stack distinct from NVIDIA CUDA. For this hardware, Windows did not provide a usable driver/runtime path and WSL could not see the PCIe device, so the node boots native Debian Linux from USB, where the kernel driver, firmware, and HailoRT can access it.
 
 ## The tested cluster
 
