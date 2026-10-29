@@ -1,0 +1,16 @@
+[Unit]
+Description=Join Dell 7680 to the dell7710 Slurm cluster
+Wants=network-online.target
+After=network-online.target munge.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 15
+ExecStart=/usr/local/sbin/configure-slurm-node
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=60s
+
+[Install]
+WantedBy=multi-user.target

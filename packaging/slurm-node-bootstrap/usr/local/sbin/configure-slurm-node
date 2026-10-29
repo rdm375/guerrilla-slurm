@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo "Run with sudo: sudo $0" >&2
+  exit 1
+fi
+
+HOST=$(hostname -s)
+if [[ "$HOST" != dell7680 ]]; then
+  echo "This script configures the Dell 7680 compute node; hostname is $HOST." >&2
+  exit 2
+fi
+
+if [[ ! -s /etc/munge/munge.key || ! -s /etc/slurm/slurm.conf ]]; then
+  echo "Waiting for the shared MUNGE key and Slurm config from dell7710." >&2
+  exit 2
+fi
+grep -q '^SlurmctldHost=dell7710$' /etc/slurm/slurm.conf || {
+  echo "/etc/slurm/slurm.conf does not point at dell7710." >&2; exit 2;
+}
+
+sed -i -E '/(^|[[:space:]])(dell7710|dell7680)([[:space:]]|$)/d' /etc/hosts
+printf '%s\n' '192.168.1.185 dell7710' '192.168.1.165 dell7680' >> /etc/hosts
+
+command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null || {
+  echo "NVIDIA GPU is not available; install/fix its driver before joining Slurm." >&2; exit 2;
+}
+[[ -e /dev/h1x-0 ]] || { echo "Hailo device /dev/h1x-0 is not available yet." >&2; exit 2; }
+
+chown munge:munge /etc/munge/munge.key
+chmod 0400 /etc/munge/munge.key
+install -d -o slurm -g slurm -m 0755 /var/lib/slurmd
+systemctl enable munge slurmd
+systemctl restart munge
+systemctl restart slurmd
+
+echo "Configured dell7680 as a Slurm compute node controlled by dell7710."
+echo "Detected GPU: $(nvidia-smi -L 2>/dev/null | head -n1 || echo unavailable)"
+echo "Detected Hailo device: $(test -e /dev/h1x-0 && echo /dev/h1x-0 || echo unavailable)"

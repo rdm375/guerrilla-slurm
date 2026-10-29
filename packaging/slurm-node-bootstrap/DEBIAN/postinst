@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+  deb-systemd-helper enable slurm-node-bootstrap.service >/dev/null || true
+fi
+exit 0

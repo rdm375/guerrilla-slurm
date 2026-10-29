@@ -1,0 +1,8 @@
+Package: slurm-node-bootstrap
+Version: 1.0
+Section: admin
+Priority: optional
+Architecture: all
+Depends: bash, slurm-wlm, munge, util-linux, systemd
+Maintainer: Local System Administrator
+Description: Join the Dell 7680 compute node to the dell7710 Slurm controller

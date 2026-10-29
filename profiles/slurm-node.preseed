@@ -1,0 +1,39 @@
+d-i auto-install/enable boolean true
+d-i debconf/priority string critical
+d-i debian-installer/locale string en_US.UTF-8
+d-i debian-installer/country string US
+d-i localechooser/supported-locales multiselect en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string dell7680
+d-i netcfg/get_domain string local
+d-i time/zone string America/Chicago
+d-i passwd/root-login boolean false
+d-i passwd/user-fullname string Slurm Administrator
+d-i passwd/username string __INSTALL_USER__
+d-i passwd/user-password-crypted password __PASSWORD_HASH__
+d-i passwd/user-default-groups string sudo
+d-i mirror/country string manual
+d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/suite string trixie
+d-i partman-auto/disk string /dev/vda
+d-i partman-auto/method string regular
+d-i partman-auto/choose_recipe select atomic
+d-i partman-auto/confirm boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i grub-installer/bootdev string /dev/vda
+d-i apt-setup/contrib boolean true
+d-i apt-setup/non-free boolean true
+d-i apt-setup/non-free-firmware boolean true
+d-i pkgsel/include string openssh-server sudo munge slurm-wlm slurm-wlm-nvml-plugin nvidia-driver firmware-nvidia-gsp firmware-iwlwifi linux-headers-amd64 dkms build-essential cmake git wget curl ca-certificates pciutils usbutils python3 python3-venv nfs-common libssl-dev libprotobuf-dev protobuf-compiler libpcap-dev libjsoncpp-dev libusb-1.0-0-dev libudev-dev pkg-config zlib1g-dev
+d-i tasksel/first multiselect standard, ssh-server
+d-i pkgsel/upgrade select full-upgrade
+d-i preseed/late_command string mkdir -p /target/etc/systemd/network && cp /cdrom/slurm/05-enp0s31f6.network /target/etc/systemd/network/05-enp0s31f6.network && printf 'auto lo\niface lo inet loopback\n' > /target/etc/network/interfaces && in-target systemctl enable systemd-networkd.service && mkdir -p /target/opt/slurm-node-usb && cp -a /cdrom/slurm/repo /target/opt/slurm-node-usb/ && printf '%s\n' 'deb [trusted=yes] file:/opt/slurm-node-usb/repo ./' > /target/etc/apt/sources.list.d/slurm-node-usb.list && in-target apt-get update && in-target sh -c 'DEBIAN_FRONTEND=noninteractive xargs -r apt-get install -y < /opt/slurm-node-usb/repo/install-packages'
+d-i grub-installer/only_debian boolean true
+d-i finish-install/reboot_in_progress note
