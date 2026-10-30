@@ -15,7 +15,7 @@ REMOTE_INSTALLER=$SCRIPT_DIR/install-enrolled-slurm-node
 usage() {
   cat >&2 <<EOF
 Usage:
-  sudo $0 init-controller CONTROLLER_IPV4
+  sudo $0 init-controller CONTROLLER_IPV4 [CLUSTER_IPV4_CIDR]
   sudo $0 enroll-worker LOGIN SSH_HOST NODE_IPV4 [SSH_PORT]
   sudo $0 enroll-discovered-workers LOGIN IPv4_CIDR [--password-stdin] [--expect-node-ids CSV]
   sudo $0 list
@@ -47,6 +47,65 @@ try:
 except ipaddress.AddressValueError:
     raise SystemExit(1)
 PY
+}
+
+resolve_cluster_cidr() {
+  local controller_ip=$1 requested_cidr=${2:-}
+  python3 - "$controller_ip" "$requested_cidr" <<'PY'
+import ipaddress, json, subprocess, sys
+address=ipaddress.IPv4Address(sys.argv[1])
+requested=sys.argv[2]
+if requested:
+    try:
+        network=ipaddress.ip_network(requested, strict=False)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid cluster IPv4 CIDR: {exc}")
+    if network.version != 4 or address not in network:
+        raise SystemExit(f"Controller address {address} is not in IPv4 network {network}")
+    print(network.with_prefixlen)
+    raise SystemExit(0)
+try:
+    interfaces=json.loads(subprocess.check_output(["ip", "-j", "-4", "address", "show"], text=True))
+except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"Could not determine the controller LAN prefix: {exc}")
+for interface in interfaces:
+    if interface.get("ifname") == "lo":
+        continue
+    for item in interface.get("addr_info", []):
+        if item.get("family") == "inet" and item.get("local") == str(address):
+            print(ipaddress.ip_interface(f"{address}/{item['prefixlen']}").network.with_prefixlen)
+            raise SystemExit(0)
+raise SystemExit(f"No local interface has controller address {address}; pass CLUSTER_IPV4_CIDR explicitly")
+PY
+}
+
+configure_controller_nfs() {
+  local controller_ip=$1 cluster_cidr=$2 share_owner share_group
+  if ! command -v exportfs >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server
+  fi
+  share_owner=${SUDO_USER:-}
+  if [[ -z $share_owner ]] || ! getent passwd "$share_owner" >/dev/null || [[ $(id -u "$share_owner") -eq 0 ]]; then
+    share_owner=$(getent passwd 1000 | cut -d: -f1)
+  fi
+  [[ -n $share_owner ]] || { echo "Could not find the shared-filesystem owner (expected SUDO_USER or UID 1000)." >&2; exit 1; }
+  share_group=$(id -gn "$share_owner")
+  install -d -o "$share_owner" -g "$share_group" -m 2775 \
+    /cluster /cluster/projects /cluster/data /cluster/results /cluster/software
+  install -d -o root -g root -m 0755 /etc/exports.d
+  printf '/cluster %s(rw,sync,no_subtree_check,fsid=0,root_squash)\n' "$cluster_cidr" \
+    > /etc/exports.d/guerrilla-slurm.exports
+  install -d -o root -g root -m 0700 "$STATE"
+  printf '%s\n' "$controller_ip" > "$STATE/controller-ip"
+  printf '%s\n' "$cluster_cidr" > "$STATE/cluster-cidr"
+  chmod 0600 "$STATE/controller-ip" "$STATE/cluster-cidr"
+  systemctl enable --now nfs-kernel-server
+  exportfs -ra
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow from "$cluster_cidr" to any port 2049 proto tcp
+  fi
+  echo "Exported /cluster over NFSv4 to $cluster_cidr (controller $controller_ip)."
 }
 
 ensure_cluster_key() {
@@ -118,6 +177,7 @@ configure_enrolled_workers() {
   chmod 0700 "$stage"
   cp "$STATE/munge.key" "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
     "$CONFIG_DIR/cgroup.conf" "$CONFIG_DIR/hosts.entries" "$REMOTE_INSTALLER" "$stage/"
+  cp "$STATE/controller-ip" "$stage/nfs-server-ip"
   chmod 0600 "$stage/munge.key"
   shopt -s nullglob
   for record in "$REGISTRY"/*.json; do
@@ -134,7 +194,7 @@ configure_enrolled_workers() {
     scp -P "$worker_port" -i "$KEY" -o BatchMode=yes \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$stage/munge.key" "$stage/slurm.conf" "$stage/gres.conf" "$stage/cgroup.conf" \
-      "$stage/hosts.entries" "$stage/install-enrolled-slurm-node" \
+      "$stage/hosts.entries" "$stage/nfs-server-ip" "$stage/install-enrolled-slurm-node" \
       "$worker_login@$worker_host:$remote_dir/"
     ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -355,9 +415,10 @@ generate_and_install_controller_config() {
 
 init_controller() {
   require_root "$@"
-  [[ $# -eq 1 ]] || usage
-  local address=$1 cluster node inventory tmp
+  [[ $# -eq 1 || $# -eq 2 ]] || usage
+  local address=$1 cluster_cidr cluster node inventory tmp
   valid_ipv4 "$address" || { echo "Controller address must be an IPv4 address." >&2; exit 2; }
+  cluster_cidr=$(resolve_cluster_cidr "$address" "${2:-}")
   ensure_controller_ready
   cluster=$(identity_value cluster_id)
   node=$(identity_value node_id)
@@ -376,6 +437,7 @@ init_controller() {
     install -o root -g root -m 0600 /etc/munge/munge.key "$STATE/munge.key"
   fi
   chmod 0600 "$STATE/munge.key"
+  configure_controller_nfs "$address" "$cluster_cidr"
   inventory=$(/usr/local/sbin/guerrilla-node-inventory)
   tmp=$(mktemp "$REGISTRY/.${node}.XXXXXX")
   GUERRILLA_INVENTORY_JSON=$inventory python3 - "$tmp" "$address" <<'PY'
@@ -479,6 +541,7 @@ PY
   trap 'rm -rf -- "$stage"' EXIT
   cp "$STATE/munge.key" "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
     "$CONFIG_DIR/cgroup.conf" "$CONFIG_DIR/hosts.entries" "$REMOTE_INSTALLER" "$stage/"
+  cp "$STATE/controller-ip" "$stage/nfs-server-ip"
   chmod 0600 "$stage/munge.key"
   shopt -s nullglob
   for record in "$REGISTRY"/*.json; do
@@ -493,7 +556,7 @@ PY
       "$worker_login@$worker_host" 'umask 077; mktemp -d /tmp/guerrilla-slurm.XXXXXX')
     scp -P "$worker_port" -i "$KEY" -o BatchMode=yes \
       "$stage/munge.key" "$stage/slurm.conf" "$stage/gres.conf" "$stage/cgroup.conf" \
-      "$stage/hosts.entries" "$stage/install-enrolled-slurm-node" \
+      "$stage/hosts.entries" "$stage/nfs-server-ip" "$stage/install-enrolled-slurm-node" \
       "$worker_login@$worker_host:$remote_dir/"
     ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
       "$worker_login@$worker_host" "sudo -n bash '$remote_dir/install-enrolled-slurm-node' '$remote_dir'"

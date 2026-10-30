@@ -169,6 +169,7 @@ import sys
 
 root, user_data, meta_data, cluster, node, role, hostname = sys.argv[1:]
 root = pathlib.Path(root)
+nfs_package = "nfs-kernel-server" if role == "controller" else "nfs-common"
 inventory = pathlib.Path(root, "scripts/guerrilla-node-inventory").read_text()
 advertise = pathlib.Path(root, "scripts/guerrilla-node-advertise").read_text()
 discover = pathlib.Path(root, "scripts/discover-guerrilla-nodes.sh").read_text()
@@ -212,7 +213,7 @@ config = {
         {"path": "/etc/systemd/network/05-guerrilla-dhcp.network", "permissions": "0644", "content": "[Match]\nName=e*\n\n[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\n"},
     ],
     "runcmd": [
-        ["/bin/bash", "-lc", "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client sshpass sudo munge slurm-wlm avahi-daemon avahi-utils pciutils"],
+        ["/bin/bash", "-lc", f"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client sshpass sudo munge slurm-wlm avahi-daemon avahi-utils pciutils {nfs_package}"],
         ["/bin/bash", "-lc", "systemctl disable --now slurmd.service slurmctld.service 2>/dev/null || true"],
         ["systemctl", "enable", "--now", "systemd-networkd.service", "ssh.service", "avahi-daemon.service"],
         ["systemctl", "daemon-reload"],

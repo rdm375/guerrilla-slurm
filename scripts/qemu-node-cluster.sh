@@ -173,12 +173,14 @@ done | paste -sd, -)
 echo "Manifest worker IDs: ${expected_worker_ids//,/ }"
 echo "Installing this checkout's enrollment command on the controller..."
 sshpass -e scp -P "$controller_port" "${SSH_OPTIONS[@]}" \
-  "$ROOT/scripts/guerrilla-cluster-admin" "$LOGIN@127.0.0.1:/tmp/guerrilla-cluster-admin"
+  "$ROOT/scripts/guerrilla-cluster-admin" \
+  "$ROOT/scripts/install-enrolled-slurm-node" \
+  "$LOGIN@127.0.0.1:/tmp/"
 ssh_node "$controller_port" \
-  'sudo install -o root -g root -m 0755 /tmp/guerrilla-cluster-admin /usr/local/sbin/guerrilla-cluster-admin && rm /tmp/guerrilla-cluster-admin'
+  'sudo install -o root -g root -m 0755 /tmp/guerrilla-cluster-admin /usr/local/sbin/guerrilla-cluster-admin && sudo install -d -o root -g root -m 0755 /usr/local/lib/guerrilla-slurm && sudo install -o root -g root -m 0755 /tmp/install-enrolled-slurm-node /usr/local/lib/guerrilla-slurm/install-enrolled-slurm-node && rm /tmp/guerrilla-cluster-admin /tmp/install-enrolled-slurm-node'
 
 echo "Initializing controller at $controller_ip..."
-ssh_node "$controller_port" "sudo /usr/local/sbin/guerrilla-cluster-admin init-controller '$controller_ip'"
+ssh_node "$controller_port" "sudo /usr/local/sbin/guerrilla-cluster-admin init-controller '$controller_ip' 192.168.77.0/24"
 echo "Automatically enrolling advertised workers..."
 printf '%s\n' "$BOOTSTRAP_PASSWORD" | sshpass -e ssh "${SSH_OPTIONS[@]}" -T -p "$controller_port" \
   "$LOGIN@127.0.0.1" \
@@ -193,6 +195,20 @@ expected_nodes=$(printf '%s\n' "${HOSTS[@]}" | sort)
   printf 'Expected nodes:\n%s\nRegistered nodes:\n%s\n' "$expected_nodes" "$actual_nodes" >&2
   exit 1
 }
+storage_probe="/cluster/results/.guerrilla-nfs-probe-${RANDOM}-$$"
+for index in "${!NODES[@]}"; do
+  IFS='|' read -r _ node role _ _ _ _ _ <<<"${NODES[$index]}"
+  [[ $role == worker ]] || continue
+  worker_port=${PORTS[$index]}
+  ssh_node "$worker_port" "printf '%s' '$node' > '$storage_probe'"
+  observed=$(ssh_node "$controller_port" "cat '$storage_probe'")
+  [[ $observed == "$node" ]] || {
+    echo "NFS write from $node was not visible on the controller." >&2
+    exit 1
+  }
+  ssh_node "$controller_port" "rm -f '$storage_probe'"
+  echo "  Shared /cluster write/read passed for $node."
+done
 ssh_node "$controller_port" "srun --immediate=30 -N $count -n $count --ntasks-per-node=1 hostname" | tee "$WORK/qemu-cluster-smoke.txt"
 actual=$(sort "$WORK/qemu-cluster-smoke.txt")
 [[ $actual == "$expected_nodes" ]] || {
@@ -201,6 +217,7 @@ actual=$(sort "$WORK/qemu-cluster-smoke.txt")
   exit 1
 }
 echo "PASS: Slurm ran one task on all $count manifest nodes."
+echo "PASS: Every worker verified shared NFS storage at /cluster."
 
 echo "Shutting down QEMU guests cleanly..."
 for index in "${!PORTS[@]}"; do ssh_node "${PORTS[$index]}" 'sudo poweroff' >/dev/null 2>&1 || true; done

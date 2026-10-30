@@ -7,11 +7,23 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 [[ $# -eq 1 && -d $1 ]] || { echo "Usage: $0 STAGING_DIRECTORY" >&2; exit 2; }
 STAGE=$1
-for name in munge.key slurm.conf gres.conf cgroup.conf hosts.entries; do
+for name in munge.key slurm.conf gres.conf cgroup.conf hosts.entries nfs-server-ip; do
   [[ -s "$STAGE/$name" || "$name" == gres.conf ]] || {
     echo "Missing staged file: $name" >&2; exit 1;
   }
 done
+NFS_SERVER=$(<"$STAGE/nfs-server-ip")
+python3 - "$NFS_SERVER" <<'PY'
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit("The staged NFS server address must be IPv4")
+PY
+if ! command -v mount.nfs4 >/dev/null 2>&1; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common
+fi
 
 install -d -o root -g root -m 0755 /etc/slurm
 install -o root -g root -m 0644 "$STAGE/slurm.conf" "$STAGE/gres.conf" \
@@ -40,8 +52,53 @@ block = f"{begin}\n{entries}\n{end}"
 hosts.write_text(old.rstrip() + "\n\n" + block + "\n", encoding="utf-8")
 PY
 
+if ! mountpoint -q /cluster; then
+  install -d -m 0755 /cluster
+fi
+python3 - "$NFS_SERVER" <<'PY'
+from pathlib import Path
+import sys
+
+path=Path("/etc/fstab")
+begin="# BEGIN GUERRILLA CLUSTER NFS"
+end="# END GUERRILLA CLUSTER NFS"
+old=path.read_text(encoding="utf-8")
+start=old.find(begin)
+if start >= 0:
+    finish=old.find(end, start)
+    if finish < 0:
+        raise SystemExit("Unclosed Guerrilla NFS block in /etc/fstab")
+    old=old[:start].rstrip()+old[finish+len(end):]
+entry=f"{sys.argv[1]}:/ /cluster nfs rw,_netdev,nofail,x-systemd.automount,nfsvers=4.2,proto=tcp 0 0"
+block=f"{begin}\n{entry}\n{end}"
+path.write_text(old.rstrip()+"\n\n"+block+"\n", encoding="utf-8")
+PY
+systemctl daemon-reload
+AUTOMOUNT_UNIT=$(systemd-escape --path --suffix=automount /cluster)
+systemctl start "$AUTOMOUNT_UNIT"
+timeout 45s stat /cluster/results >/dev/null
+mountpoint -q /cluster || { echo "NFS did not mount at /cluster." >&2; exit 1; }
+mount_details=$(findmnt -n -o FSTYPE,OPTIONS --target /cluster/results)
+python3 - "$mount_details" <<'PY'
+import sys
+
+valid_mounts=[]
+for line in sys.argv[1].splitlines():
+    fields=line.split(None, 1)
+    if len(fields) != 2:
+        continue
+    fstype, raw_options=fields
+    options=dict(item.split("=", 1) for item in raw_options.split(",") if "=" in item)
+    version=options.get("vers", options.get("nfsvers", ""))
+    if fstype in {"nfs", "nfs4"} and version.startswith("4."):
+        valid_mounts.append(version)
+if not valid_mounts:
+    raise SystemExit(f"/cluster is not mounted with NFSv4: {sys.argv[1]}")
+print(f"Verified NFSv{valid_mounts[0]} mount at /cluster")
+PY
+
 systemctl enable munge slurmd
 systemctl restart munge
 systemctl restart slurmd
 rm -rf -- "$STAGE"
-echo "Installed cluster credentials and Slurm configuration; slurmd restarted."
+echo "Installed Slurm configuration and mounted NFSv4 shared storage at /cluster; slurmd restarted."
