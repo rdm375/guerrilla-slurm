@@ -25,7 +25,7 @@ Install the host tools:
 
 ```sh
 sudo apt update
-sudo apt install curl openssl cloud-image-utils qemu-utils qemu-system-x86 ovmf
+sudo apt install curl openssl cloud-image-utils qemu-utils qemu-system-x86 ovmf sshpass
 ```
 
 The supplied USB SSD is about 119.5 GB. Use a 100 GiB image so it fits. Set the size on the first build; the script does not shrink an existing image:
@@ -193,7 +193,49 @@ Hailo is an inference accelerator, not a general CUDA device. Applications need 
 
 ## Add another compute node
 
-The current scripts do **not** add arbitrary nodes with one command. `setup-controller.sh`, `configure-node.sh`, the default `join-compute-node.sh` workflow, and the benchmark/smoke-test scripts encode the Dell 7710/7680 names, addresses, resources, or accelerator layout. `configure-node.sh` specifically requires both a working NVIDIA GPU and a Hailo device. Do not use it unchanged for a CPU-only or differently equipped machine.
+### Generate generic raw images for a laptop cluster
+
+The generic-image path is separate from the tested Dell 7710/7680 path above. It creates one raw Debian image per row in a CSV manifest, embeds the node's cluster ID, node ID, role, and hostname, installs Slurm/MUNGE/mDNS and the cluster administration tools on first QEMU boot, and advertises the node's SSH endpoint on the local link. It uses raw cloud images; no custom ISO is required.
+
+Start from the example manifest and edit the node rows. Use exactly one `controller` row; the remaining nodes use `worker`:
+
+```csv
+cluster_id,node_id,role,hostname
+field-cluster,node-01,controller,gc-controller
+field-cluster,node-02,worker,gc-node-02
+```
+
+Build the per-node raw images and private NoCloud seed files:
+
+```sh
+./build-node-images.sh build config/nodes.example.csv
+```
+
+The script asks for one Linux login and password used by these initial images. The raw images are written to `output/nodes/`; seed files and the password hash stay under the ignored, permission-restricted `work-nodes/` directory. Do not commit either directory. The N-node QEMU qualification below completes first boot, cluster enrollment, and a cross-node CPU test automatically.
+
+### Automatically qualify an N-node QEMU cluster
+
+The image manifest already describes the controller and every worker. After building the raw images, run the cluster test once from the Ubuntu host:
+
+```sh
+NODE_IMAGE_OUTPUT_DIR="$PWD/output/n-node-test" \
+  bash ./build-node-images.sh build config/nodes.qemu-3.example.csv
+
+NODE_IMAGE_OUTPUT_DIR="$PWD/output/n-node-test" QEMU_MEMORY=2G QEMU_CPUS=2 \
+  bash ./scripts/qemu-node-cluster.sh config/nodes.qemu-3.example.csv
+```
+
+The runner boots all manifest nodes on a private QEMU LAN, waits for cloud-init, checks each node's identity and inventory, assigns test IPv4 addresses, initializes the manifest's controller, discovers and enrolls all advertised workers, generates and distributes Slurm configuration once, runs one task per node, and shuts the guests down cleanly. It prompts once for the shared initial login password. Host-side `sshpass` is used to automate SSH access; the guest images install it for batch enrollment. Adjust `QEMU_MEMORY` to fit the number of simultaneous guests and host RAM.
+
+The test network is local to QEMU on this host and does not bridge to the physical network. The runner waits for every manifest worker's mDNS advertisement and confirms Slurm registered exactly the manifest node set before scheduling the smoke job. The resulting raw images contain the test cluster configuration and use the `192.168.77.0/24` test subnet. This qualification checks provisioning, discovery, enrollment, and CPU scheduling; it does not validate physical laptop firmware, accelerators, or deployment addresses.
+
+**Qualification passed on 2026-10-30:** three Debian 13 guests (one controller and two workers) booted on the Dell 7710 host with 2 vCPUs and 2 GiB configured memory each. Cloud-init completed on all nodes; mDNS discovered both workers; batch enrollment generated and distributed a three-node Slurm configuration; `srun` ran one `hostname` task on each node and returned `gc-controller`, `gc-node-02`, and `gc-node-03`. The runner then shut down all guests cleanly. This qualifies the generic QEMU path; physical USB boot and accelerator workloads remain to be tested.
+
+After the runner reports `PASS`, review the node registry and Slurm state by booting the controller image or re-running the test with a separate clean output directory. Slurm configuration is generated from each worker's detected CPU and accelerator inventory. NVIDIA devices use generic `gpu` resources with node-specific autodetection; Hailo devices use `hailo10h`.
+
+This workflow assumes a closed trusted IPv4 LAN. It does not elect a controller, remove stale nodes automatically, handle controller failover, or provision shared NFS storage. The controller role remains explicit in the manifest. For the larger multi-laptop direction, see [the self-organizing cluster design](docs/self-organizing-cluster.md).
+
+`build-node-images.sh` creates per-node boot images but does not enroll workers into Slurm. `setup-controller.sh`, `configure-node.sh`, the default `join-compute-node.sh` workflow, and the benchmark/smoke-test scripts still encode the Dell 7710/7680 names, addresses, resources, or accelerator layout. `configure-node.sh` specifically requires both a working NVIDIA GPU and a Hailo device. Do not use it unchanged for a CPU-only or differently equipped machine.
 
 To extend this cluster safely:
 

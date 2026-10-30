@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IDENTITY=/etc/guerrilla-node/node.json
+readarray -t VALUES < <(python3 - "$IDENTITY" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    data = json.load(source)
+print(data["hostname"])
+print(data["node_id"])
+print(data["role"])
+PY
+)
+HOST=${VALUES[0]}
+NODE_ID=${VALUES[1]}
+ROLE=${VALUES[2]}
+exec /usr/bin/avahi-publish-service \
+  "guerrilla-${HOST}" _guerrilla-node._tcp 22 \
+  "node_id=${NODE_ID}" "role=${ROLE}"

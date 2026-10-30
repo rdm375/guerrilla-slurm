@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo "Run this installer through sudo on the target node." >&2
+  exit 1
+fi
+[[ $# -eq 1 && -d $1 ]] || { echo "Usage: $0 STAGING_DIRECTORY" >&2; exit 2; }
+STAGE=$1
+for name in munge.key slurm.conf gres.conf cgroup.conf hosts.entries; do
+  [[ -s "$STAGE/$name" || "$name" == gres.conf ]] || {
+    echo "Missing staged file: $name" >&2; exit 1;
+  }
+done
+
+install -d -o root -g root -m 0755 /etc/slurm
+install -o root -g root -m 0644 "$STAGE/slurm.conf" "$STAGE/gres.conf" \
+  "$STAGE/cgroup.conf" /etc/slurm/
+install -d -o munge -g munge -m 0700 /etc/munge
+install -o munge -g munge -m 0400 "$STAGE/munge.key" /etc/munge/munge.key
+install -d -o slurm -g slurm -m 0755 /var/lib/slurmd
+
+python3 - "$STAGE/hosts.entries" <<'PY'
+from pathlib import Path
+import sys
+
+hosts = Path("/etc/hosts")
+entries = Path(sys.argv[1]).read_text(encoding="utf-8").rstrip()
+begin = "# BEGIN GUERRILLA SLURM HOSTS"
+end = "# END GUERRILLA SLURM HOSTS"
+old = hosts.read_text(encoding="utf-8")
+start = old.find(begin)
+if start >= 0:
+    finish = old.find(end, start)
+    if finish < 0:
+        raise SystemExit("Unclosed Guerrilla Slurm hosts block in /etc/hosts")
+    finish += len(end)
+    old = old[:start].rstrip() + old[finish:]
+block = f"{begin}\n{entries}\n{end}"
+hosts.write_text(old.rstrip() + "\n\n" + block + "\n", encoding="utf-8")
+PY
+
+systemctl enable munge slurmd
+systemctl restart munge
+systemctl restart slurmd
+rm -rf -- "$STAGE"
+echo "Installed cluster credentials and Slurm configuration; slurmd restarted."

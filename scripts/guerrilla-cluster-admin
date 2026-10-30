@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ ! -f $SCRIPT_DIR/generate-slurm-config.py ]]; then
+  SCRIPT_DIR=/usr/local/lib/guerrilla-slurm
+fi
+STATE=/var/lib/guerrilla-node
+REGISTRY=$STATE/enrolled
+CONFIG_DIR=$STATE/generated
+KEY=/root/.ssh/guerrilla-cluster-ed25519
+GENERATOR=$SCRIPT_DIR/generate-slurm-config.py
+REMOTE_INSTALLER=$SCRIPT_DIR/install-enrolled-slurm-node
+
+usage() {
+  cat >&2 <<EOF
+Usage:
+  sudo $0 init-controller CONTROLLER_IPV4
+  sudo $0 enroll-worker LOGIN SSH_HOST NODE_IPV4 [SSH_PORT]
+  sudo $0 enroll-discovered-workers LOGIN IPv4_CIDR [--password-stdin] [--expect-node-ids CSV]
+  sudo $0 list
+
+The discovered-worker command enrolls every worker advertised on the selected
+IPv4 subnet. --expect-node-ids waits until every comma-separated node ID is
+visible before enrolling. It assumes that subnet is trusted and uses the
+shared bootstrap password configured when the node images were built.
+EOF
+  exit 2
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || { echo "Run with sudo: sudo $0 $*" >&2; exit 1; }
+}
+
+identity_value() {
+  python3 - "$1" <<'PY'
+import json, sys
+print(json.load(open("/etc/guerrilla-node/node.json", encoding="utf-8"))[sys.argv[1]])
+PY
+}
+
+valid_ipv4() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit(1)
+PY
+}
+
+ensure_cluster_key() {
+  install -d -o root -g root -m 0700 /root/.ssh
+  if [[ ! -s $KEY || ! -s $KEY.pub ]]; then
+    rm -f "$KEY" "$KEY.pub"
+    ssh-keygen -q -t ed25519 -N '' -C guerrilla-cluster-controller -f "$KEY"
+    chmod 0600 "$KEY"
+    chmod 0644 "$KEY.pub"
+  fi
+}
+
+install_hosts_block() {
+  python3 - "$CONFIG_DIR/hosts.entries" <<'PY'
+from pathlib import Path
+import sys
+
+hosts = Path("/etc/hosts")
+entries = Path(sys.argv[1]).read_text(encoding="utf-8").rstrip()
+begin = "# BEGIN GUERRILLA SLURM HOSTS"
+end = "# END GUERRILLA SLURM HOSTS"
+old = hosts.read_text(encoding="utf-8")
+start = old.find(begin)
+if start >= 0:
+    finish = old.find(end, start)
+    if finish < 0:
+        raise SystemExit("Unclosed Guerrilla Slurm hosts block in /etc/hosts")
+    old = old[:start].rstrip() + old[finish + len(end):]
+hosts.write_text(old.rstrip() + f"\n\n{begin}\n{entries}\n{end}\n", encoding="utf-8")
+PY
+}
+
+ensure_controller_ready() {
+  [[ $(hostname -s) == "$(identity_value hostname)" ]] || {
+    echo "System hostname does not match /etc/guerrilla-node/node.json." >&2; exit 1;
+  }
+  [[ $(identity_value role) == controller ]] || {
+    echo "This command must run on the manifest's controller node." >&2; exit 1;
+  }
+  command -v slurmd >/dev/null && command -v munge >/dev/null || {
+    echo "Install the Slurm and MUNGE packages before controller setup." >&2; exit 1;
+  }
+  if [[ ! -s $STATE/munge.key && ! -s /etc/munge/munge.key ]] &&
+     ! command -v create-munge-key >/dev/null && ! command -v mungekey >/dev/null; then
+    echo "MUNGE is installed, but no MUNGE key-generation utility was found." >&2
+    exit 1
+  fi
+}
+
+create_munge_key() {
+  if command -v create-munge-key >/dev/null; then
+    create-munge-key -f
+  elif command -v mungekey >/dev/null; then
+    mungekey --create --force --key-file /etc/munge/munge.key
+  else
+    echo "No supported MUNGE key-generation utility was found." >&2
+    return 1
+  fi
+}
+
+configure_enrolled_workers() {
+  generate_and_install_controller_config
+  scontrol reconfigure
+  systemctl restart slurmd
+
+  local record worker worker_login worker_host worker_port remote_dir
+  ENROLL_STAGE=$(mktemp -d /run/guerrilla-slurm-enroll.XXXXXX)
+  local stage=$ENROLL_STAGE
+  chmod 0700 "$stage"
+  cp "$STATE/munge.key" "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
+    "$CONFIG_DIR/cgroup.conf" "$CONFIG_DIR/hosts.entries" "$REMOTE_INSTALLER" "$stage/"
+  chmod 0600 "$stage/munge.key"
+  shopt -s nullglob
+  for record in "$REGISTRY"/*.json; do
+    [[ $(basename "$record") == "$(identity_value node_id).json" ]] && continue
+    worker=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["role"])' "$record")
+    [[ $worker == worker ]] || continue
+    worker_login=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_login"])' "$record")
+    worker_host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_host"])' "$record")
+    worker_port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_port"])' "$record")
+    echo "Updating Slurm configuration on $(basename "$record" .json)..."
+    remote_dir=$(ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "$worker_login@$worker_host" 'umask 077; mktemp -d /tmp/guerrilla-slurm.XXXXXX')
+    scp -P "$worker_port" -i "$KEY" -o BatchMode=yes \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "$stage/munge.key" "$stage/slurm.conf" "$stage/gres.conf" "$stage/cgroup.conf" \
+      "$stage/hosts.entries" "$stage/install-enrolled-slurm-node" \
+      "$worker_login@$worker_host:$remote_dir/"
+    ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "$worker_login@$worker_host" "sudo -n bash '$remote_dir/install-enrolled-slurm-node' '$remote_dir'"
+  done
+  rm -rf -- "$stage"
+  unset ENROLL_STAGE
+}
+
+discover_worker_candidates() {
+  local cidr=$1
+  local output status=0
+  output=$(timeout 3 avahi-browse --resolve --terminate --parsable _guerrilla-node._tcp 2>/dev/null) || status=$?
+  [[ $status -eq 0 || $status -eq 124 ]] || return "$status"
+  AVAHI_OUTPUT=$output python3 - "$cidr" <<'PY'
+import ipaddress
+import os
+import re
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+if network.version != 4:
+    raise SystemExit("Only IPv4 networks are supported")
+found = {}
+for raw in os.environ["AVAHI_OUTPUT"].splitlines():
+    fields = raw.rstrip("\n").split(";")
+    if len(fields) < 9 or fields[0] != "=" or fields[2] != "IPv4":
+        continue
+    address = fields[7]
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except ipaddress.AddressValueError:
+        continue
+    if ip not in network:
+        continue
+    txt = ";".join(fields[9:])
+    node = re.search(r'"node_id=([a-z][a-z0-9-]{0,30})"', txt)
+    role = re.search(r'"role=(controller|worker)"', txt)
+    if not node or not role or role.group(1) != "worker":
+        continue
+    node_id = node.group(1)
+    candidate = (node_id, address)
+    if node_id in found and found[node_id] != address:
+        raise SystemExit(f"Multiple worker addresses for {node_id} on {network}: {found[node_id]}, {address}")
+    found[node_id] = address
+for node_id, address in sorted(found.items()):
+    print(f"{node_id}\t{address}")
+PY
+}
+
+enroll_discovered_workers() {
+  require_root "$@"
+  [[ $# -ge 2 ]] || usage
+  local login=$1 cidr=$2 password candidate_file node address remote_inventory advertised_node
+  local password_stdin=0 expected_node_ids= scan_file missing_nodes
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --password-stdin) password_stdin=1; shift ;;
+      --expect-node-ids)
+        [[ $# -ge 2 && -z $expected_node_ids ]] || usage
+        expected_node_ids=$2
+        shift 2
+        ;;
+      *) usage ;;
+    esac
+  done
+  [[ $login =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || { echo "Invalid Linux login name." >&2; exit 2; }
+  python3 - "$cidr" <<'PY'
+import ipaddress, sys
+try:
+    network=ipaddress.ip_network(sys.argv[1], strict=False)
+    if network.version != 4:
+        raise ValueError("only IPv4 networks are supported")
+except ValueError as exc:
+    raise SystemExit(f"Invalid IPv4 CIDR: {exc}")
+PY
+  [[ $(identity_value role) == controller ]] || { echo "This command must run on the controller." >&2; exit 1; }
+  [[ -s $STATE/munge.key && -s $REGISTRY/$(identity_value node_id).json ]] || {
+    echo "Initialize the controller first." >&2; exit 1;
+  }
+  command -v avahi-browse >/dev/null || { echo "Install avahi-utils first." >&2; exit 1; }
+  command -v sshpass >/dev/null || { echo "Install sshpass before batch enrollment." >&2; exit 1; }
+  if [[ -n $expected_node_ids ]]; then
+    EXPECTED_NODE_IDS=$expected_node_ids python3 - <<'PY'
+import os, re
+ids=os.environ["EXPECTED_NODE_IDS"].split(",")
+if not ids or any(not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", item) for item in ids) or len(ids) != len(set(ids)):
+    raise SystemExit("Invalid --expect-node-ids CSV")
+PY
+    echo "Expected worker IDs: ${expected_node_ids//,/ }"
+  else
+    echo "Expected worker IDs: not specified"
+  fi
+  if [[ $password_stdin -eq 1 ]]; then
+    IFS= read -r password || true
+  else
+    read -r -s -p "Shared initial node password: " password; printf '\n'
+  fi
+  [[ -n $password ]] || { echo "Bootstrap password cannot be empty." >&2; exit 1; }
+  ensure_cluster_key
+  ENROLL_TEMP_DIR=$(mktemp -d /run/guerrilla-enrollment.XXXXXX)
+  candidate_file=$ENROLL_TEMP_DIR/candidates.tsv
+  scan_file=$ENROLL_TEMP_DIR/scan.tsv
+  mkdir "$ENROLL_TEMP_DIR/batch"
+  trap 'rm -rf -- "$ENROLL_TEMP_DIR" "${ENROLL_STAGE:-}"' EXIT
+  : > "$candidate_file"
+  for attempt in $(seq 1 30); do
+    discover_worker_candidates "$cidr" > "$scan_file"
+    missing_nodes=$(python3 - "$candidate_file" "$scan_file" "$expected_node_ids" <<'PY'
+import pathlib, sys
+combined={}
+for name in sys.argv[1:3]:
+    for line in pathlib.Path(name).read_text().splitlines():
+        if not line:
+            continue
+        node, address=line.split("\t", 1)
+        if node in combined and combined[node] != address:
+            raise SystemExit(f"Multiple worker addresses for {node}: {combined[node]}, {address}")
+        combined[node]=address
+pathlib.Path(sys.argv[1]).write_text("".join(f"{node}\t{combined[node]}\n" for node in sorted(combined)))
+expected=set(filter(None, sys.argv[3].split(",")))
+print(",".join(sorted(expected-set(combined))))
+PY
+)
+    if [[ -z $expected_node_ids || -z $missing_nodes ]]; then break; fi
+    if (( attempt % 5 == 0 )); then
+      echo "Waiting for expected worker advertisements: ${missing_nodes//,/ } (scan $attempt/30)"
+    fi
+    sleep 2
+  done
+  echo "Discovered worker IDs: $(cut -f1 "$candidate_file" | paste -sd' ' -)"
+  if [[ ! -s $candidate_file ]]; then
+    echo "No worker advertisements found in $cidr. Controller discovery diagnostics:" >&2
+    ip -brief -4 address >&2 || true
+    systemctl is-active avahi-daemon.service guerrilla-node-advertise.service >&2 || true
+    timeout 5 avahi-browse --resolve --terminate --parsable _guerrilla-node._tcp >&2 || true
+    exit 1
+  fi
+  if [[ -n $expected_node_ids && -n $missing_nodes ]]; then
+    echo "Timed out waiting for expected workers: ${missing_nodes//,/ }" >&2
+    exit 1
+  fi
+
+  local batch=$ENROLL_TEMP_DIR/batch
+  while IFS=$'\t' read -r advertised_node address <&3; do
+    echo "Inspecting $advertised_node at $address..."
+    SSHPASS=$password sshpass -e ssh-copy-id -i "$KEY.pub" -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null "$login@$address" >/dev/null
+    remote_inventory=$(ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null "$login@$address" sudo -n /usr/local/sbin/guerrilla-node-inventory)
+    node=$(GUERRILLA_INVENTORY_JSON=$remote_inventory python3 - "$STATE" "$advertised_node" <<'PY'
+import json, os, pathlib, sys
+item=json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
+controller=json.loads((pathlib.Path(sys.argv[1]) / "enrolled" / (json.loads(pathlib.Path("/etc/guerrilla-node/node.json").read_text())["node_id"] + ".json")).read_text())
+if item.get("cluster_id") != controller.get("cluster_id"):
+    raise SystemExit(f"Cluster ID mismatch for {item.get('hostname')}: {item.get('cluster_id')!r}")
+if item.get("role") != "worker":
+    raise SystemExit(f"Expected worker, received role={item.get('role')!r}")
+if item.get("node_id") != sys.argv[2]:
+    raise SystemExit(f"mDNS node_id {sys.argv[2]!r} does not match SSH inventory {item.get('node_id')!r}")
+print(item["node_id"])
+PY
+)
+    GUERRILLA_INVENTORY_JSON=$remote_inventory python3 - "$batch" "$node" "$address" "$login" <<'PY'
+import json, os, pathlib, sys
+item=json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
+if item["node_id"] != sys.argv[2]:
+    raise SystemExit(f"mDNS node_id does not match SSH inventory for {sys.argv[2]}")
+item.update(slurm_address=sys.argv[3], ssh_login=sys.argv[4], ssh_host=sys.argv[3], ssh_port=22)
+path=pathlib.Path(sys.argv[1]) / f"{item['node_id']}.json"
+path.write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
+PY
+    printf '  %-16s %-24s %s CPUs=%s RAM=%s\n' "$node" \
+      "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hostname"])' <<<"$remote_inventory")" \
+      "$address" \
+      "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["cpu_count"])' <<<"$remote_inventory")" \
+      "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["memory_bytes"])' <<<"$remote_inventory")"
+  done 3< "$candidate_file"
+
+  python3 - "$REGISTRY" "$batch" <<'PY'
+import json, pathlib, sys
+registry, batch = map(pathlib.Path, sys.argv[1:])
+replacements = {p.name: json.loads(p.read_text()) for p in batch.glob("*.json")}
+records = [json.loads(p.read_text()) for p in registry.glob("*.json") if p.name not in replacements]
+records.extend(replacements.values())
+for key in ("node_id", "hostname", "slurm_address"):
+    values = [item[key] for item in records]
+    if len(values) != len(set(values)):
+        raise SystemExit(f"Duplicate {key} in discovered and previously enrolled nodes")
+clusters = {item["cluster_id"] for item in records}
+if len(clusters) != 1:
+    raise SystemExit("Registry contains multiple cluster IDs")
+PY
+  shopt -s nullglob
+  local record
+  for record in "$batch"/*.json; do
+    install -o root -g root -m 0600 "$record" "$REGISTRY/$(basename "$record")"
+  done
+  unset password SSHPASS
+  configure_enrolled_workers
+  echo "Enrolled $(find "$batch" -maxdepth 1 -name '*.json' | wc -l) discovered workers."
+  rm -rf -- "$ENROLL_TEMP_DIR" "${ENROLL_STAGE:-}"
+  unset ENROLL_TEMP_DIR ENROLL_STAGE
+  trap - EXIT
+}
+
+generate_and_install_controller_config() {
+  python3 "$GENERATOR" "$REGISTRY" "$CONFIG_DIR"
+  install -d -o root -g root -m 0755 /etc/slurm
+  install -o root -g root -m 0644 "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
+    "$CONFIG_DIR/cgroup.conf" /etc/slurm/
+  install -d -o munge -g munge -m 0700 /etc/munge
+  install -o munge -g munge -m 0400 "$STATE/munge.key" /etc/munge/munge.key
+  install -d -o slurm -g slurm -m 0755 /var/lib/slurmctld /var/lib/slurmd
+  install_hosts_block
+}
+
+init_controller() {
+  require_root "$@"
+  [[ $# -eq 1 ]] || usage
+  local address=$1 cluster node inventory tmp
+  valid_ipv4 "$address" || { echo "Controller address must be an IPv4 address." >&2; exit 2; }
+  ensure_controller_ready
+  cluster=$(identity_value cluster_id)
+  node=$(identity_value node_id)
+  install -d -o root -g root -m 0700 "$REGISTRY"
+  for existing in "$REGISTRY"/*.json; do
+    [[ -e $existing ]] || continue
+    [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cluster_id"])' "$existing") == "$cluster" ]] || {
+      echo "Registry contains a different cluster ID; refusing to mix clusters." >&2; exit 1;
+    }
+  done
+  install -d -o root -g root -m 0700 "$STATE"
+  if [[ ! -s $STATE/munge.key ]]; then
+    if [[ ! -s /etc/munge/munge.key ]]; then
+      create_munge_key
+    fi
+    install -o root -g root -m 0600 /etc/munge/munge.key "$STATE/munge.key"
+  fi
+  chmod 0600 "$STATE/munge.key"
+  inventory=$(/usr/local/sbin/guerrilla-node-inventory)
+  tmp=$(mktemp "$REGISTRY/.${node}.XXXXXX")
+  GUERRILLA_INVENTORY_JSON=$inventory python3 - "$tmp" "$address" <<'PY'
+import json, os, pathlib, sys
+item = json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
+item["slurm_address"] = sys.argv[2]
+pathlib.Path(sys.argv[1]).write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
+PY
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$REGISTRY/$node.json"
+  generate_and_install_controller_config
+  systemctl enable munge slurmctld slurmd
+  systemctl restart munge
+  if systemctl is-active --quiet slurmctld; then
+    scontrol reconfigure
+  else
+    systemctl start slurmctld
+  fi
+  systemctl restart slurmd || systemctl start slurmd
+  echo "Controller initialized for cluster '$cluster' at $address."
+  scontrol ping
+}
+
+enroll_worker() {
+  require_root "$@"
+  [[ $# -ge 3 && $# -le 4 ]] || usage
+  local login=$1 ssh_host=$2 address=$3 port=${4:-22} cluster remote_inventory node tmp
+  [[ $login =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || { echo "Invalid Linux login name." >&2; exit 2; }
+  [[ $ssh_host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { echo "SSH host must be an IPv4 address or DNS/mDNS name." >&2; exit 2; }
+  valid_ipv4 "$address" || { echo "Slurm node address must be IPv4." >&2; exit 2; }
+  [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "Invalid SSH port." >&2; exit 2; }
+  ensure_controller_ready
+  cluster=$(identity_value cluster_id)
+  [[ -s $STATE/munge.key && -s $REGISTRY/$(identity_value node_id).json ]] || {
+    echo "Initialize the controller first with: sudo $0 init-controller CONTROLLER_IPV4" >&2; exit 1;
+  }
+  ensure_cluster_key
+  echo "On the worker's local console, run: sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"
+  local host_key actual_fingerprint expected_fingerprint
+  host_key=$(ssh-keyscan -p "$port" -t ed25519 "$ssh_host" 2>/dev/null || true)
+  [[ -n $host_key ]] || { echo "Could not fetch the worker's SSH host key." >&2; exit 1; }
+  actual_fingerprint=$(printf '%s\n' "$host_key" | ssh-keygen -lf - | awk 'NR == 1 {print $2}')
+  echo "Fingerprint received over the network: $actual_fingerprint"
+  [[ -t 0 ]] || { echo "Host-key verification requires an interactive terminal." >&2; exit 1; }
+  read -r -p "Enter the matching fingerprint shown on the worker console: " expected_fingerprint
+  [[ $expected_fingerprint == "$actual_fingerprint" ]] || {
+    echo "Fingerprint mismatch; refusing SSH enrollment." >&2; exit 1;
+  }
+  install -d -o root -g root -m 0700 /root/.ssh
+  touch /root/.ssh/known_hosts
+  chmod 0600 /root/.ssh/known_hosts
+  printf '%s\n' "$host_key" >> /root/.ssh/known_hosts
+  ssh-copy-id -o StrictHostKeyChecking=yes -i "$KEY.pub" -p "$port" "$login@$ssh_host"
+  ssh_common=(-p "$port" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes)
+  remote_inventory=$(ssh "${ssh_common[@]}" "$login@$ssh_host" sudo -n /usr/local/sbin/guerrilla-node-inventory)
+  node=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["node_id"])' <<<"$remote_inventory")
+  GUERRILLA_INVENTORY_JSON=$remote_inventory python3 - "$cluster" <<'PY'
+import json, os, sys
+item = json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
+if item.get("cluster_id") != sys.argv[1]:
+    raise SystemExit(f"Cluster ID mismatch: worker is {item.get('cluster_id')!r}")
+if item.get("role") != "worker":
+    raise SystemExit(f"Refusing to enroll role={item.get('role')!r}; expected worker")
+PY
+  echo "Worker identity received over SSH:"
+  GUERRILLA_INVENTORY_JSON=$remote_inventory python3 - <<'PY'
+import json, os
+x=json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
+print(f"  cluster_id: {x['cluster_id']}\n  node_id:    {x['node_id']}\n  hostname:   {x['hostname']}\n  role:       {x['role']}\n  address:    {', '.join(x.get('ipv4', []))}\n  CPUs:       {x.get('cpu_count')}\n  RAM bytes:  {x.get('memory_bytes')}\n  GPUs:       {', '.join(x.get('nvidia_gpus', [])) or 'none'}\n  Hailo:      {', '.join(x.get('hailo_devices', [])) or 'none'}")
+PY
+  [[ -t 0 ]] || { echo "Enrollment approval requires an interactive terminal." >&2; exit 1; }
+  local approval
+  read -r -p "Type '$node' to approve enrollment: " approval
+  [[ $approval == "$node" ]] || { echo "Enrollment not approved." >&2; exit 1; }
+
+  install -d -o root -g root -m 0700 "$REGISTRY"
+  for existing in "$REGISTRY"/*.json; do
+    [[ -e $existing ]] || continue
+    [[ $(basename "$existing") == "$node.json" ]] && continue
+    [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("hostname", ""))' "$existing") != \
+       $(python3 -c 'import json,sys; print(json.load(sys.stdin)["hostname"])' <<<"$remote_inventory") ]] || {
+      echo "Another enrolled node already uses this hostname." >&2; exit 1;
+    }
+  done
+  tmp=$(mktemp "$REGISTRY/.${node}.XXXXXX")
+  GUERRILLA_INVENTORY_JSON=$remote_inventory python3 - "$tmp" "$address" "$login" "$ssh_host" "$port" <<'PY'
+import json, os, pathlib, sys
+item=json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
+item.update(slurm_address=sys.argv[2], ssh_login=sys.argv[3], ssh_host=sys.argv[4], ssh_port=int(sys.argv[5]))
+pathlib.Path(sys.argv[1]).write_text(json.dumps(item, indent=2, sort_keys=True) + "\n")
+PY
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$REGISTRY/$node.json"
+
+  generate_and_install_controller_config
+  scontrol reconfigure
+  systemctl restart slurmd
+  local stage worker worker_login worker_host worker_port remote_dir
+  stage=$(mktemp -d /run/guerrilla-slurm-enroll.XXXXXX)
+  chmod 0700 "$stage"
+  trap 'rm -rf -- "$stage"' EXIT
+  cp "$STATE/munge.key" "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
+    "$CONFIG_DIR/cgroup.conf" "$CONFIG_DIR/hosts.entries" "$REMOTE_INSTALLER" "$stage/"
+  chmod 0600 "$stage/munge.key"
+  shopt -s nullglob
+  for record in "$REGISTRY"/*.json; do
+    [[ $(basename "$record") == "$(identity_value node_id).json" ]] && continue
+    worker=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["role"])' "$record")
+    [[ $worker == worker ]] || continue
+    worker_login=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_login"])' "$record")
+    worker_host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_host"])' "$record")
+    worker_port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_port"])' "$record")
+    echo "Updating Slurm configuration on $(basename "$record" .json)..."
+    remote_dir=$(ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+      "$worker_login@$worker_host" 'umask 077; mktemp -d /tmp/guerrilla-slurm.XXXXXX')
+    scp -P "$worker_port" -i "$KEY" -o BatchMode=yes \
+      "$stage/munge.key" "$stage/slurm.conf" "$stage/gres.conf" "$stage/cgroup.conf" \
+      "$stage/hosts.entries" "$stage/install-enrolled-slurm-node" \
+      "$worker_login@$worker_host:$remote_dir/"
+    ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+      "$worker_login@$worker_host" "sudo -n bash '$remote_dir/install-enrolled-slurm-node' '$remote_dir'"
+  done
+  rm -rf -- "$stage"
+  trap - EXIT
+  echo "Enrolled $node. The controller generated and distributed Slurm configuration."
+  scontrol show node "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostname"])' "$REGISTRY/$node.json")" || true
+}
+
+list_nodes() {
+  require_root "$@"
+  [[ $# -eq 0 ]] || usage
+  if [[ ! -d $REGISTRY ]]; then echo "Controller has no enrollment registry."; return; fi
+  python3 - "$REGISTRY" <<'PY'
+import json, pathlib, sys
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+    item=json.loads(path.read_text())
+    print(f"{item.get('node_id','?'):16} {item.get('role','?'):10} {item.get('hostname','?'):24} {item.get('slurm_address','?')}")
+PY
+}
+
+[[ $# -ge 1 ]] || usage
+command=$1; shift
+case "$command" in
+  init-controller) init_controller "$@" ;;
+  enroll-worker) enroll_worker "$@" ;;
+  enroll-discovered-workers) enroll_discovered_workers "$@" ;;
+  list) list_nodes "$@" ;;
+  *) usage ;;
+esac

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+
+identity_path = pathlib.Path("/etc/guerrilla-node/node.json")
+identity = json.loads(identity_path.read_text())
+
+def command_output(args):
+    try:
+        result = subprocess.run(args, check=False, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+memory_kib = 0
+for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
+    if line.startswith("MemTotal:"):
+        memory_kib = int(line.split()[1])
+        break
+
+addresses = []
+try:
+    ip_data = json.loads(command_output(["ip", "-j", "-4", "address", "show"]) or "[]")
+    for interface in ip_data:
+        if interface.get("operstate") != "UP" or interface.get("ifname") == "lo":
+            continue
+        addresses.extend(
+            item["local"] for item in interface.get("addr_info", [])
+            if item.get("scope") == "global"
+        )
+except (json.JSONDecodeError, KeyError, TypeError):
+    pass
+
+slurm_topology = command_output(["slurmd", "-C"])
+gpu_output = command_output(["nvidia-smi", "-L"]) if shutil.which("nvidia-smi") else ""
+inventory = {
+    **identity,
+    "observed_hostname": socket.gethostname(),
+    "ipv4": sorted(set(addresses)),
+    "cpu_count": os.cpu_count(),
+    "memory_bytes": memory_kib * 1024,
+    "slurm_topology": slurm_topology,
+    "nvidia_gpus": [line.strip() for line in gpu_output.splitlines() if line.strip()],
+    "hailo_devices": sorted(str(path) for path in pathlib.Path("/dev").glob("h1x-*")),
+    "kernel": os.uname().release,
+}
+
+encoded = json.dumps(inventory, indent=2, sort_keys=True) + "\n"
+output = pathlib.Path("/var/lib/guerrilla-node/inventory.json")
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(encoded)
+print(encoded, end="")

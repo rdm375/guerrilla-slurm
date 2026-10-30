@@ -1,0 +1,3 @@
+cluster_id,node_id,role,hostname
+field-cluster,node-01,controller,gc-controller
+field-cluster,node-02,worker,gc-node-02

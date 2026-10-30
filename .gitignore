@@ -4,6 +4,7 @@
 /tmp/
 /work/
 /work-cloud/
+/work-nodes/
 *.iso
 *.img
 *.raw

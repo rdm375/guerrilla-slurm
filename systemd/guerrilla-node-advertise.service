@@ -1,0 +1,13 @@
+[Unit]
+Description=Advertise this Guerrilla Cluster node over mDNS
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service ssh.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/guerrilla-node-advertise
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
