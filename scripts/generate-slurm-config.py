@@ -97,9 +97,11 @@ def main():
     config = [
         f"ClusterName={controller['cluster_id']}",
         f"SlurmctldHost={controller['hostname']}",
+        "ReturnToService=2",
         "SlurmUser=slurm",
         "SlurmctldPort=6817",
         "SlurmdPort=6818",
+        "SrunPortRange=60001-63000",
         "AuthType=auth/munge",
         "StateSaveLocation=/var/lib/slurmctld",
         "SlurmdSpoolDir=/var/lib/slurmd",

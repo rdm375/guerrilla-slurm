@@ -4,11 +4,11 @@ Guerrilla Cluster is a practical kit for putting idle laptops to work: prepare a
 
 The USB drive contains a provisioned Debian system, not just an installer. In this workflow the laptop boots and runs from that external drive; the image-writing step targets the USB device, not the laptop's internal disk. A 100 GiB image is used in the tested setup, so the USB drive must be large enough. Performance and reliability depend on the USB device.
 
-This repository is the tested configuration for one small cluster, not yet a universal one-click node builder. It documents the image build, Slurm controller, shared storage, and node-join steps, then explains what must change to adapt them to other laptops.
+The repository contains two distinct workflows: a generic Debian raw-image path for a manifest-defined CPU cluster, and a Dell-specific physical profile with the NVIDIA/Hailo configuration below. The generic path has passed a three-node QEMU qualification; physical USB boot on the target laptops is still pending. Treat the Dell-specific instructions as a separate, hardware-specific workflow.
 
 The tested compute node exposes its CPU, NVIDIA GPU, and ASUS Hailo-10H AI accelerator to Slurm jobs. The Hailo-10H is sometimes called a TPU here, but it is a Hailo AI accelerator with a software stack distinct from NVIDIA CUDA. For this hardware, Windows did not provide a usable driver/runtime path and WSL could not see the PCIe device, so the node boots native Debian Linux from USB, where the kernel driver, firmware, and HailoRT can access it.
 
-## The tested cluster
+## Existing Dell-specific physical profile
 
 | Host | Address | Role | Slurm resources |
 |---|---|---|---|
@@ -195,7 +195,7 @@ Hailo is an inference accelerator, not a general CUDA device. Applications need 
 
 ### Generate generic raw images for a laptop cluster
 
-The generic-image path is separate from the Dell-specific path above. It creates one raw Debian image per row in a CSV manifest, embeds the node's cluster ID, node ID, role, and hostname, installs Slurm/MUNGE/mDNS and the cluster administration tools on first QEMU boot, and advertises the node's SSH endpoint on the local link. The controller image includes the NFS server; worker images include the NFS client. It uses raw cloud images; no custom ISO is required.
+The generic raw-image path creates one Debian image per row in a CSV manifest, embeds the node's cluster ID, node ID, role, and hostname, installs Slurm/MUNGE/mDNS/chrony and the cluster administration tools, and advertises the node's SSH endpoint on the local link. The controller image includes the NFS server; worker images include the NFS client. It uses raw cloud images; no custom ISO is required. It is the path to use for a new manifest-defined laptop cluster. The Dell-specific instructions above are not prerequisites for it.
 
 Start from the example manifest and edit the node rows. Use exactly one `controller` row; the remaining nodes use `worker`:
 
@@ -211,7 +211,16 @@ Build the per-node raw images and private NoCloud seed files:
 ./build-node-images.sh build config/nodes.example.csv
 ```
 
-The script asks for one Linux login and password used by these initial images. The raw images are written to `output/nodes/`; seed files and the password hash stay under the ignored, permission-restricted `work-nodes/` directory. Do not commit either directory. The N-node QEMU qualification below completes first boot, cluster enrollment, and a cross-node CPU test automatically.
+The script asks for one Linux login and password used by these initial images. The raw images are written to `output/nodes/`; seed files and the password hash stay under the ignored, permission-restricted `work-nodes/` directory. Do not commit either directory. The N-node QEMU qualification below exercises first boot, cluster enrollment, shared storage, a batch job, and worker recovery automatically.
+
+After qualification, write the matching raw image to each USB system drive. Identify the destination carefully; the writer refuses mounted disks and the disk containing the running system, and asks you to type the exact device path before erasing:
+
+```sh
+lsblk -o PATH,SIZE,MODEL,TRAN,MOUNTPOINTS
+sudo ./write-node-image.sh output/n-node-test/node-01.raw /dev/disk/by-id/USB_DEVICE_ID
+```
+
+Replace the example image path and device ID for each node. The script writes the entire raw image to the whole device. It has not been exercised against a physical USB drive in this milestone.
 
 ### Automatically qualify an N-node QEMU cluster
 
@@ -225,15 +234,50 @@ NODE_IMAGE_OUTPUT_DIR="$PWD/output/n-node-test" QEMU_MEMORY=2G QEMU_CPUS=2 \
   bash ./scripts/qemu-node-cluster.sh config/nodes.qemu-3.example.csv
 ```
 
-The runner boots all manifest nodes on a private QEMU LAN, waits for cloud-init, checks each node's identity and inventory, assigns test IPv4 addresses, initializes the manifest's controller, discovers and enrolls all advertised workers, configures NFSv4 shared storage, generates and distributes Slurm configuration, verifies worker writes are visible on the controller under `/cluster`, runs one task per node, and shuts the guests down cleanly. It prompts once for the shared initial login password. Host-side `sshpass` is used to automate SSH access; the guest images install it for batch enrollment. Adjust `QEMU_MEMORY` to fit the number of simultaneous guests and host RAM.
+The runner first provisions each raw image, then uses disposable disk overlays for the cluster test. It boots all manifest nodes on a private QEMU LAN, checks each node's identity and inventory, assigns test IPv4 addresses, initializes the manifest's controller, discovers and enrolls all advertised workers, configures NFSv4 shared storage and chrony, generates and distributes Slurm configuration, verifies worker writes are visible on the controller under `/cluster`, runs both an interactive task and a multi-node `sbatch` job, reboots a worker with a changed test address and reconciles it using its existing SSH key, and reboots the controller to check service recovery. Adjust `QEMU_MEMORY` to fit the number of simultaneous guests and host RAM.
 
-The test network is local to QEMU on this host and does not bridge to the physical network. The runner waits for every manifest worker's mDNS advertisement and confirms Slurm registered exactly the manifest node set. It also writes a probe file from each worker under `/cluster/results` and checks that the controller sees the write before scheduling the CPU smoke job. The resulting raw images contain the test cluster configuration and use the `192.168.77.0/24` test subnet. This qualification checks provisioning, discovery, enrollment, NFS sharing, and CPU scheduling; it does not validate physical laptop firmware, accelerators, or deployment addresses.
+The test network is local to QEMU on this host and does not bridge to the physical network. It checks clock sync on all nodes, exact Slurm membership, NFS write/read, `srun`, `sbatch`, worker reboot/address refresh, and controller reboot recovery. Cluster changes happen in disposable QEMU overlays; the per-node raw images are first-boot provisioned but do not retain the test subnet or cluster enrollment. They are the images to write to USB after review. This still does not validate physical laptop firmware, USB boot, battery/lid behavior, accelerator workloads, or real LAN DHCP behavior.
 
 On a physical cluster, `init-controller CONTROLLER_IPV4 [CLUSTER_IPV4_CIDR]` exports the controller's `/cluster` directory to the supplied CIDR. If the CIDR is omitted, the tool derives it from the interface holding the controller address. Enrolled workers mount the NFSv4 export at `/cluster` with a systemd automount. The controller creates `projects`, `data`, `results`, and `software` subdirectories. Use the same numeric UID/GID for the shared login on every node so file ownership is consistent.
 
-**Three-node QEMU qualification, including shared storage, passed on 2026-10-30:** three Debian 13 guests (one controller and two workers) booted on the Dell 7710 host with 2 vCPUs and 2 GiB configured memory each. Cloud-init completed without errors, mDNS discovered both workers, and batch enrollment generated and distributed the three-node Slurm configuration. Both workers mounted the controller's export as NFSv4.2 at `/cluster`; each worker wrote a probe under `/cluster/results` that the controller read successfully. `srun` ran one `hostname` task on each node and returned `gc-controller`, `gc-node-02`, and `gc-node-03`. The runner shut down all guests cleanly. This qualifies the generic QEMU provisioning, enrollment, shared-storage, and CPU scheduling path. Physical USB boot and accelerator workloads remain untested.
+**Three-node QEMU qualification passed on 2026-10-30:** the prior run verified Debian 13 provisioning, automatic worker enrollment, NFSv4.2 at `/cluster`, cross-node writes, and a `srun` task on each guest. The current runner adds chrony checks, a multi-node batch job, worker reboot/address-refresh coverage, and controller reboot recovery; run the commands above to qualify those additions. Physical USB boot and accelerator workloads remain untested.
 
-After the runner reports `PASS`, review the node registry and Slurm state by booting the controller image or re-running the test with a separate clean output directory. Slurm configuration is generated from each worker's detected CPU and accelerator inventory. NVIDIA devices use generic `gpu` resources with node-specific autodetection; Hailo devices use `hailo10h`.
+### Operate and recover the generic cluster
+
+The controller provides time to workers with chrony. It uses an upstream Debian NTP pool when reachable and a local fallback so all nodes still share the controller's clock on an isolated LAN. Slurm/MUNGE health depends on the nodes keeping time aligned. Keep the controller on a stable address or DHCP reservation.
+
+In the generic setup, `/cluster` is currently a directory on the controller's system filesystem. That is sufficient for a small pilot, but its capacity and availability are tied to the controller drive. Use a reliable SSD with enough free space for shared data and keep independent backups; NFS is shared access, not replication.
+
+After an enrolled worker reboots, its Slurm/MUNGE configuration and NFS automount should come back from disk. If its address changes, refresh the controller's inventory and distributed configuration with:
+
+```sh
+sudo /usr/local/sbin/guerrilla-cluster-admin enroll-discovered-workers LOGIN 192.168.1.0/24
+```
+
+Replace `LOGIN` and the CIDR with the physical cluster values. Existing enrolled workers use the controller's installed SSH key, so this reconciliation does not need the initial password. A new worker still requires its initial account password for enrollment. To remove a worker, first wait for an empty Slurm queue; the command drains the node, disables `slurmd` if reachable, and removes it from the generated configuration:
+
+```sh
+sudo /usr/local/sbin/guerrilla-cluster-admin remove-worker NODE_ID
+```
+
+After a controller reboot, check `sudo scontrol ping`, `sinfo -N`, `chronyc tracking`, and `findmnt /cluster`. For data recovery, mount a separate backup disk and run:
+
+```sh
+sudo /usr/local/sbin/guerrilla-backup-controller /media/LOGIN/backup
+```
+
+The backup contains the controller identity, MUNGE key, SSH enrollment key, node registry, Slurm saved state, NFS configuration, and all of `/cluster`; treat it as secret and keep it off the controller. It refuses destinations on the root or shared-data filesystem, refuses to run while jobs are queued/running, and briefly stops Slurm while saving its state. Store a copy on a separate disk away from the laptop. To restore, first verify the checksum file, install compatible Debian and the packages (`slurm-wlm`, `munge`, `nfs-kernel-server`, `chrony`), stop `munge`, `slurmctld`, `slurmd`, and `nfs-kernel-server`, then extract the matching archives while preserving owners/ACLs/xattrs:
+
+```sh
+sudo tar --numeric-owner --acls --xattrs -xzf guerrilla-controller-system-TIMESTAMP.tar.gz -C /
+sudo install -d /cluster
+sudo tar --numeric-owner --acls --xattrs -xzf guerrilla-cluster-data-TIMESTAMP.tar.gz -C /cluster
+sudo systemctl daemon-reload
+```
+
+Restore the controller's stable address before starting chrony, NFS, MUNGE, and Slurm. Verify `scontrol ping`, the expected `sinfo -N` list, NFS export/mount visibility, and a small `sbatch` job. This restore sequence is documented but has not yet been fault-injection tested. The controller has no automatic failover; this is a single-controller design.
+
+After the runner reports `PASS`, the controller registry and Slurm state are available in the QEMU overlay/logs for review. Slurm configuration is generated from each worker's detected CPU and accelerator inventory. NVIDIA devices use generic `gpu` resources with node-specific autodetection; Hailo devices use `hailo10h`. GRES discovery is configuration generation only; it does not install or qualify device drivers.
 
 This workflow assumes a closed trusted IPv4 LAN. It does not elect a controller, remove stale nodes automatically, or handle controller failover. The controller role remains explicit in the manifest. For the larger multi-laptop direction, see [the self-organizing cluster design](docs/self-organizing-cluster.md).
 

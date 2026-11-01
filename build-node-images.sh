@@ -177,6 +177,7 @@ service = pathlib.Path(root, "systemd/guerrilla-node-advertise.service").read_te
 admin = pathlib.Path(root, "scripts/guerrilla-cluster-admin").read_text()
 generator = pathlib.Path(root, "scripts/generate-slurm-config.py").read_text()
 remote_installer = pathlib.Path(root, "scripts/install-enrolled-slurm-node").read_text()
+backup_script = pathlib.Path(root, "scripts/backup-guerrilla-controller.sh").read_text()
 identity = json.dumps({
     "cluster_id": cluster,
     "node_id": node,
@@ -213,13 +214,25 @@ config = {
         {"path": "/etc/systemd/network/05-guerrilla-dhcp.network", "permissions": "0644", "content": "[Match]\nName=e*\n\n[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\n"},
     ],
     "runcmd": [
-        ["/bin/bash", "-lc", f"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client sshpass sudo munge slurm-wlm avahi-daemon avahi-utils pciutils {nfs_package}"],
+        ["/bin/bash", "-lc", f"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client sshpass sudo munge slurm-wlm avahi-daemon avahi-utils pciutils chrony {nfs_package}"],
         ["/bin/bash", "-lc", "systemctl disable --now slurmd.service slurmctld.service 2>/dev/null || true"],
-        ["systemctl", "enable", "--now", "systemd-networkd.service", "ssh.service", "avahi-daemon.service"],
+        ["systemctl", "enable", "--now", "systemd-networkd.service", "ssh.service", "avahi-daemon.service", "chrony.service"],
         ["systemctl", "daemon-reload"],
         ["systemctl", "enable", "--now", "guerrilla-node-advertise.service"],
     ],
 }
+required_tools = ["slurmd", "munge", "chronyc", "avahi-publish-service"]
+required_tools.append("exportfs" if role == "controller" else "mount.nfs4")
+config["runcmd"].append([
+    "/bin/bash", "-lc",
+    "for tool in " + " ".join(required_tools) + "; do command -v \"$tool\" >/dev/null || exit 1; done; slurmd -C >/dev/null",
+])
+if role == "controller":
+    config["write_files"].append({
+        "path": "/usr/local/sbin/guerrilla-backup-controller",
+        "permissions": "0750",
+        "content": backup_script,
+    })
 pathlib.Path(user_data).write_text("#cloud-config\n" + json.dumps(config, indent=2) + "\n")
 pathlib.Path(meta_data).write_text(
     f"instance-id: guerrilla-{cluster}-{node}\nlocal-hostname: {hostname}\n"
@@ -229,7 +242,7 @@ PY
     echo "  raw:  $RAW"
     echo "  seed: $SEED (private; contains the account password hash)"
   done < "$NODES_TSV"
-  echo "Images created. Boot each image once with '$0 qemu MANIFEST.csv NODE_ID' before writing its raw file to USB."
+  echo "Images created. The N-node QEMU runner performs first boot before qualification; alternatively boot an image with '$0 qemu MANIFEST.csv NODE_ID'."
   exit 0
 fi
 

@@ -18,6 +18,7 @@ Usage:
   sudo $0 init-controller CONTROLLER_IPV4 [CLUSTER_IPV4_CIDR]
   sudo $0 enroll-worker LOGIN SSH_HOST NODE_IPV4 [SSH_PORT]
   sudo $0 enroll-discovered-workers LOGIN IPv4_CIDR [--password-stdin] [--expect-node-ids CSV]
+  sudo $0 remove-worker NODE_ID
   sudo $0 list
 
 The discovered-worker command enrolls every worker advertised on the selected
@@ -104,8 +105,50 @@ configure_controller_nfs() {
   exportfs -ra
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow from "$cluster_cidr" to any port 2049 proto tcp
+    ufw allow from "$cluster_cidr" to any port 22 proto tcp
+    ufw allow from "$cluster_cidr" to any port 6817:6818 proto tcp
+    ufw allow from "$cluster_cidr" to any port 60001:63000 proto tcp
+    ufw allow from "$cluster_cidr" to any port 123 proto udp
+    ufw allow from "$cluster_cidr" to any port 5353 proto udp
   fi
   echo "Exported /cluster over NFSv4 to $cluster_cidr (controller $controller_ip)."
+}
+
+configure_controller_time() {
+  local controller_ip=$1 cluster_cidr=$2
+  if ! command -v chronyc >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y chrony
+  fi
+  cat > /etc/chrony/chrony.conf <<EOF
+pool 2.debian.pool.ntp.org iburst
+allow $cluster_cidr
+local stratum 10
+makestep 1.0 3
+rtcsync
+EOF
+  systemctl enable --now chrony.service
+  systemctl restart chrony.service
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow from "$cluster_cidr" to any port 123 proto udp
+  fi
+  echo "Configured chrony time service on $controller_ip for $cluster_cidr."
+}
+
+configure_controller_boot_order() {
+  install -d -o root -g root -m 0755 /etc/systemd/system/slurmctld.service.d /etc/systemd/system/slurmd.service.d
+  cat > /etc/systemd/system/slurmctld.service.d/guerrilla-network.conf <<'EOF'
+[Unit]
+Wants=network-online.target
+After=network-online.target chrony.service nfs-kernel-server.service munge.service
+EOF
+  cat > /etc/systemd/system/slurmd.service.d/guerrilla-network.conf <<'EOF'
+[Unit]
+Wants=network-online.target
+After=network-online.target chrony.service munge.service
+EOF
+  systemctl enable systemd-networkd-wait-online.service
+  systemctl daemon-reload
 }
 
 ensure_cluster_key() {
@@ -168,8 +211,6 @@ create_munge_key() {
 
 configure_enrolled_workers() {
   generate_and_install_controller_config
-  scontrol reconfigure
-  systemctl restart slurmd
 
   local record worker worker_login worker_host worker_port remote_dir
   ENROLL_STAGE=$(mktemp -d /run/guerrilla-slurm-enroll.XXXXXX)
@@ -178,6 +219,7 @@ configure_enrolled_workers() {
   cp "$STATE/munge.key" "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
     "$CONFIG_DIR/cgroup.conf" "$CONFIG_DIR/hosts.entries" "$REMOTE_INSTALLER" "$stage/"
   cp "$STATE/controller-ip" "$stage/nfs-server-ip"
+  cp "$STATE/cluster-cidr" "$stage/cluster-cidr"
   chmod 0600 "$stage/munge.key"
   shopt -s nullglob
   for record in "$REGISTRY"/*.json; do
@@ -194,12 +236,13 @@ configure_enrolled_workers() {
     scp -P "$worker_port" -i "$KEY" -o BatchMode=yes \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$stage/munge.key" "$stage/slurm.conf" "$stage/gres.conf" "$stage/cgroup.conf" \
-      "$stage/hosts.entries" "$stage/nfs-server-ip" "$stage/install-enrolled-slurm-node" \
+      "$stage/hosts.entries" "$stage/nfs-server-ip" "$stage/cluster-cidr" "$stage/install-enrolled-slurm-node" \
       "$worker_login@$worker_host:$remote_dir/"
     ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes \
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "$worker_login@$worker_host" "sudo -n bash '$remote_dir/install-enrolled-slurm-node' '$remote_dir'"
   done
+  scontrol reconfigure
   rm -rf -- "$stage"
   unset ENROLL_STAGE
 }
@@ -289,12 +332,10 @@ PY
   else
     echo "Expected worker IDs: not specified"
   fi
+  password=
   if [[ $password_stdin -eq 1 ]]; then
     IFS= read -r password || true
-  else
-    read -r -s -p "Shared initial node password: " password; printf '\n'
   fi
-  [[ -n $password ]] || { echo "Bootstrap password cannot be empty." >&2; exit 1; }
   ensure_cluster_key
   ENROLL_TEMP_DIR=$(mktemp -d /run/guerrilla-enrollment.XXXXXX)
   candidate_file=$ENROLL_TEMP_DIR/candidates.tsv
@@ -342,10 +383,22 @@ PY
   local batch=$ENROLL_TEMP_DIR/batch
   while IFS=$'\t' read -r advertised_node address <&3; do
     echo "Inspecting $advertised_node at $address..."
-    SSHPASS=$password sshpass -e ssh-copy-id -i "$KEY.pub" -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null "$login@$address" >/dev/null
-    remote_inventory=$(ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null "$login@$address" sudo -n /usr/local/sbin/guerrilla-node-inventory)
+    remote_inventory=
+    if [[ -s $REGISTRY/$advertised_node.json ]]; then
+      remote_inventory=$(ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null "$login@$address" sudo -n /usr/local/sbin/guerrilla-node-inventory 2>/dev/null || true)
+    fi
+    if [[ -z $remote_inventory ]]; then
+      if [[ -z $password ]]; then
+        [[ -t 0 ]] || { echo "A bootstrap password is required to enroll $advertised_node." >&2; exit 1; }
+        read -r -s -p "Shared initial node password: " password; printf '\n'
+      fi
+      [[ -n $password ]] || { echo "Bootstrap password cannot be empty." >&2; exit 1; }
+      SSHPASS=$password sshpass -e ssh-copy-id -i "$KEY.pub" -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null "$login@$address" >/dev/null
+      remote_inventory=$(ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null "$login@$address" sudo -n /usr/local/sbin/guerrilla-node-inventory)
+    fi
     node=$(GUERRILLA_INVENTORY_JSON=$remote_inventory python3 - "$STATE" "$advertised_node" <<'PY'
 import json, os, pathlib, sys
 item=json.loads(os.environ["GUERRILLA_INVENTORY_JSON"])
@@ -438,6 +491,8 @@ init_controller() {
   fi
   chmod 0600 "$STATE/munge.key"
   configure_controller_nfs "$address" "$cluster_cidr"
+  configure_controller_time "$address" "$cluster_cidr"
+  configure_controller_boot_order
   inventory=$(/usr/local/sbin/guerrilla-node-inventory)
   tmp=$(mktemp "$REGISTRY/.${node}.XXXXXX")
   GUERRILLA_INVENTORY_JSON=$inventory python3 - "$tmp" "$address" <<'PY'
@@ -534,7 +589,6 @@ PY
 
   generate_and_install_controller_config
   scontrol reconfigure
-  systemctl restart slurmd
   local stage worker worker_login worker_host worker_port remote_dir
   stage=$(mktemp -d /run/guerrilla-slurm-enroll.XXXXXX)
   chmod 0700 "$stage"
@@ -542,6 +596,7 @@ PY
   cp "$STATE/munge.key" "$CONFIG_DIR/slurm.conf" "$CONFIG_DIR/gres.conf" \
     "$CONFIG_DIR/cgroup.conf" "$CONFIG_DIR/hosts.entries" "$REMOTE_INSTALLER" "$stage/"
   cp "$STATE/controller-ip" "$stage/nfs-server-ip"
+  cp "$STATE/cluster-cidr" "$stage/cluster-cidr"
   chmod 0600 "$stage/munge.key"
   shopt -s nullglob
   for record in "$REGISTRY"/*.json; do
@@ -556,11 +611,12 @@ PY
       "$worker_login@$worker_host" 'umask 077; mktemp -d /tmp/guerrilla-slurm.XXXXXX')
     scp -P "$worker_port" -i "$KEY" -o BatchMode=yes \
       "$stage/munge.key" "$stage/slurm.conf" "$stage/gres.conf" "$stage/cgroup.conf" \
-      "$stage/hosts.entries" "$stage/nfs-server-ip" "$stage/install-enrolled-slurm-node" \
+      "$stage/hosts.entries" "$stage/nfs-server-ip" "$stage/cluster-cidr" "$stage/install-enrolled-slurm-node" \
       "$worker_login@$worker_host:$remote_dir/"
     ssh -p "$worker_port" -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
       "$worker_login@$worker_host" "sudo -n bash '$remote_dir/install-enrolled-slurm-node' '$remote_dir'"
   done
+  scontrol reconfigure
   rm -rf -- "$stage"
   trap - EXIT
   echo "Enrolled $node. The controller generated and distributed Slurm configuration."
@@ -579,12 +635,51 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
 PY
 }
 
+remove_worker() {
+  require_root "$@"
+  [[ $# -eq 1 ]] || usage
+  local node=$1 record hostname login host port active
+  [[ $node =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "Invalid node_id." >&2; exit 2; }
+  [[ $(identity_value role) == controller ]] || { echo "This command must run on the controller." >&2; exit 1; }
+  record="$REGISTRY/$node.json"
+  [[ -s $record ]] || { echo "Node is not enrolled: $node" >&2; exit 1; }
+  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["role"])' "$record") == worker ]] || {
+    echo "Refusing to remove the controller node." >&2; exit 1;
+  }
+  if [[ -n $(squeue -h 2>/dev/null || true) ]]; then
+    echo "Wait until the Slurm queue is empty before removing a node; configuration is updated cluster-wide." >&2
+    exit 1
+  fi
+  hostname=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hostname"])' "$record")
+  login=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_login"])' "$record")
+  host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_host"])' "$record")
+  port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_port"])' "$record")
+  scontrol update NodeName="$hostname" State=DRAIN Reason="operator requested removal"
+  active=$(squeue -h -w "$hostname" -t RUNNING,COMPLETING -o '%i' || true)
+  if [[ -n $active ]]; then
+    echo "$hostname is drained; wait for its active jobs to finish, then rerun remove-worker $node." >&2
+    printf '%s\n' "$active" >&2
+    exit 1
+  fi
+  if ssh -p "$port" -i "$KEY" -o BatchMode=yes -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$login@$host" \
+    'sudo -n systemctl disable --now slurmd.service' >/dev/null 2>&1; then
+    echo "Stopped and disabled slurmd on $hostname."
+  else
+    echo "Worker $hostname is unreachable; its local slurmd service could not be disabled."
+  fi
+  rm -f -- "$record"
+  configure_enrolled_workers
+  echo "Removed $node ($hostname) from the controller registry and Slurm configuration."
+}
+
 [[ $# -ge 1 ]] || usage
 command=$1; shift
 case "$command" in
   init-controller) init_controller "$@" ;;
   enroll-worker) enroll_worker "$@" ;;
   enroll-discovered-workers) enroll_discovered_workers "$@" ;;
+  remove-worker) remove_worker "$@" ;;
   list) list_nodes "$@" ;;
   *) usage ;;
 esac

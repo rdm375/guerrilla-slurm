@@ -7,28 +7,38 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 [[ $# -eq 1 && -d $1 ]] || { echo "Usage: $0 STAGING_DIRECTORY" >&2; exit 2; }
 STAGE=$1
-for name in munge.key slurm.conf gres.conf cgroup.conf hosts.entries nfs-server-ip; do
+for name in munge.key slurm.conf gres.conf cgroup.conf hosts.entries nfs-server-ip cluster-cidr; do
   [[ -s "$STAGE/$name" || "$name" == gres.conf ]] || {
     echo "Missing staged file: $name" >&2; exit 1;
   }
 done
 NFS_SERVER=$(<"$STAGE/nfs-server-ip")
-python3 - "$NFS_SERVER" <<'PY'
+CLUSTER_CIDR=$(<"$STAGE/cluster-cidr")
+python3 - "$NFS_SERVER" "$CLUSTER_CIDR" <<'PY'
 import ipaddress, sys
 try:
     ipaddress.IPv4Address(sys.argv[1])
+    network=ipaddress.ip_network(sys.argv[2], strict=False)
+    if network.version != 4:
+        raise ValueError("only IPv4 networks are supported")
 except ipaddress.AddressValueError:
     raise SystemExit("The staged NFS server address must be IPv4")
+except ValueError as exc:
+    raise SystemExit(f"The staged cluster network must be IPv4: {exc}")
 PY
-if ! command -v mount.nfs4 >/dev/null 2>&1; then
+if ! command -v mount.nfs4 >/dev/null 2>&1 || ! command -v chronyc >/dev/null 2>&1; then
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common
+  DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common chrony
 fi
 
 install -d -o root -g root -m 0755 /etc/slurm
 install -o root -g root -m 0644 "$STAGE/slurm.conf" "$STAGE/gres.conf" \
   "$STAGE/cgroup.conf" /etc/slurm/
 install -d -o munge -g munge -m 0700 /etc/munge
+MUNGE_KEY_CHANGED=0
+if ! cmp -s "$STAGE/munge.key" /etc/munge/munge.key 2>/dev/null; then
+  MUNGE_KEY_CHANGED=1
+fi
 install -o munge -g munge -m 0400 "$STAGE/munge.key" /etc/munge/munge.key
 install -d -o slurm -g slurm -m 0755 /var/lib/slurmd
 
@@ -97,8 +107,40 @@ if not valid_mounts:
 print(f"Verified NFSv{valid_mounts[0]} mount at /cluster")
 PY
 
+cat > /etc/chrony/chrony.conf <<EOF
+server $NFS_SERVER iburst prefer
+makestep 1.0 3
+rtcsync
+EOF
+systemctl enable --now chrony.service
+systemctl restart chrony.service
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  ufw allow from "$CLUSTER_CIDR" to any port 22 proto tcp
+  ufw allow from "$CLUSTER_CIDR" to any port 6818 proto tcp
+  ufw allow from "$CLUSTER_CIDR" to any port 60001:63000 proto tcp
+  ufw allow from "$CLUSTER_CIDR" to any port 123 proto udp
+  ufw allow from "$CLUSTER_CIDR" to any port 5353 proto udp
+fi
+chronyc -n sources >/dev/null || { echo "chrony could not query the controller time source." >&2; exit 1; }
+echo "Configured chrony to use controller $NFS_SERVER."
+
+install -d -o root -g root -m 0755 /etc/systemd/system/slurmd.service.d
+cat > /etc/systemd/system/slurmd.service.d/guerrilla-network.conf <<'EOF'
+[Unit]
+Wants=network-online.target
+After=network-online.target chrony.service munge.service
+EOF
+systemctl enable systemd-networkd-wait-online.service
+systemctl daemon-reload
+
 systemctl enable munge slurmd
-systemctl restart munge
-systemctl restart slurmd
+if [[ $MUNGE_KEY_CHANGED -eq 1 ]]; then
+  systemctl restart munge
+elif ! systemctl is-active --quiet munge.service; then
+  systemctl start munge
+fi
+if ! systemctl is-active --quiet slurmd.service; then
+  systemctl start slurmd
+fi
 rm -rf -- "$STAGE"
-echo "Installed Slurm configuration and mounted NFSv4 shared storage at /cluster; slurmd restarted."
+echo "Installed Slurm configuration and mounted NFSv4 shared storage at /cluster; existing daemons were kept running."
