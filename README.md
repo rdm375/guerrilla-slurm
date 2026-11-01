@@ -240,7 +240,7 @@ The test network is local to QEMU on this host and does not bridge to the physic
 
 On a physical cluster, `init-controller CONTROLLER_IPV4 [CLUSTER_IPV4_CIDR]` exports the controller's `/cluster` directory to the supplied CIDR. If the CIDR is omitted, the tool derives it from the interface holding the controller address. Enrolled workers mount the NFSv4 export at `/cluster` with a systemd automount. The controller creates `projects`, `data`, `results`, and `software` subdirectories. Use the same numeric UID/GID for the shared login on every node so file ownership is consistent.
 
-**Three-node QEMU qualification passed on 2026-10-30:** the prior run verified Debian 13 provisioning, automatic worker enrollment, NFSv4.2 at `/cluster`, cross-node writes, and a `srun` task on each guest. The current runner adds chrony checks, a multi-node batch job, worker reboot/address-refresh coverage, and controller reboot recovery; run the commands above to qualify those additions. Physical USB boot and accelerator workloads remain untested.
+**Full three-node QEMU qualification passed on 2026-11-01.** All guests completed Debian 13 provisioning with cloud-init status `done` and no errors, enrolled automatically, synchronized clocks, and mounted NFSv4.2 at `/cluster`. An interactive `srun` and a multi-node `sbatch` each ran one task on every manifest node; workers verified shared-storage writes. A worker rebooted, rejoined with its existing key, and refreshed its address to `192.168.77.211`. After a controller reboot, Slurm, NFS, and chrony recovered, all manifest nodes returned to `IDLE`, shared-storage checks passed, and cross-node scheduling worked again. The test used 2 vCPUs and 2 GiB per guest on a private QEMU network. Physical USB boot, real-LAN behavior, and accelerator workloads remain untested.
 
 ### Operate and recover the generic cluster
 
@@ -275,7 +275,7 @@ sudo tar --numeric-owner --acls --xattrs -xzf guerrilla-cluster-data-TIMESTAMP.t
 sudo systemctl daemon-reload
 ```
 
-Restore the controller's stable address before starting chrony, NFS, MUNGE, and Slurm. Verify `scontrol ping`, the expected `sinfo -N` list, NFS export/mount visibility, and a small `sbatch` job. This restore sequence is documented but has not yet been fault-injection tested. The controller has no automatic failover; this is a single-controller design.
+Restore the controller's stable address before starting chrony, NFS, MUNGE, and Slurm. Verify `scontrol ping`, the expected `sinfo -N` list, NFS export/mount visibility, and a small `sbatch` job. On 2026-11-01, backup creation and archive extraction passed a disposable-fixture check: real tar/checksum operations verified the archives, checksums, controller identity, MUNGE key, shared data, and private file permissions; mocked Slurm stop/restart behavior and the queued-job and same-filesystem refusal guards also passed. The mount and service environment was mocked, so this did not test a real backup disk or restoring a live controller's services. Controller-level disaster recovery remains untested. The controller has no automatic failover; this is a single-controller design.
 
 After the runner reports `PASS`, the controller registry and Slurm state are available in the QEMU overlay/logs for review. Slurm configuration is generated from each worker's detected CPU and accelerator inventory. NVIDIA devices use generic `gpu` resources with node-specific autodetection; Hailo devices use `hailo10h`. GRES discovery is configuration generation only; it does not install or qualify device drivers.
 
