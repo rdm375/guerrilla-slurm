@@ -1,10 +1,30 @@
 # Guerrilla Cluster: boot idle laptops into Slurm compute nodes
 
-Guerrilla Cluster is a practical kit for putting idle laptops to work: prepare a bootable USB system drive, plug it into a laptop, boot Linux, connect it to the cluster network, and schedule jobs. It is meant for assembling useful compute from available machines without first building a conventional server rack.
+Guerrilla Cluster is a practical kit for putting idle laptops to work: prepare a bootable USB system drive, plug it into a laptop, boot Linux, connect it to the cluster network, and schedule jobs. It is meant for assembling an HPC cluster from all the computers in the house.
+
+## Why this started
+
+This project began with one specific problem: I wanted the NVIDIA GPU and Hailo-10H AI accelerator in a Dell Precision 7680 to be available as Slurm resources. The Hailo Windows driver refused to install on that system, so I set up a Debian boot drive and ran Linux directly from USB. That let the Hailo software stack access the accelerator outside Windows and WSL.
+
+The practical goal was to run numerical performance tests on the GPU and Hailo accelerator in a consistent way across the Dell Precision 7710 and 7680. Instead of setting up and launching tests separately on each laptop, I could boot the 7680 from USB, join it to the Slurm cluster with the Dell 7710, and run tests across both machines from the same cluster. That made repeated comparisons much quicker and simpler.
+
+The original work was specific to those two laptops and their accelerators. The manifest-driven image builder and N-node enrollment workflow grew from that experience: keep USB boot and Slurm simple for the original use, then make it practical to bring other idle machines into the same kind of cluster.
 
 The USB drive is intended to contain a provisioned Debian system, not just an installer. The laptop boots and runs from that external drive; the image-writing step targets the USB device, not the laptop's internal disk. The generic raw image defaults to 100 GiB, so the USB drive must be large enough. QEMU qualification used this image size; physical USB behavior has not yet been tested. Performance and reliability depend on the USB device.
 
 The primary workflow builds one Debian raw image per manifest entry, writes each image to a USB system drive, and forms an N-node Slurm cluster on a trusted wired LAN. The generic CPU cluster passed a three-node QEMU qualification, including worker and controller reboot recovery. Physical USB boot and real-LAN operation remain to be qualified. The Dell 7710/7680 instructions document an older, hardware-specific profile and are separate from the generic image workflow.
+
+## Cluster features
+
+- **USB-bootable Debian nodes:** Build a separate raw system image for each node in a CSV manifest, with its cluster ID, node ID, role, and hostname.
+- **Manifest-defined Slurm cluster:** Assign one controller and as many worker nodes as needed; each node joins the same named cluster.
+- **Automatic discovery and enrollment:** Nodes advertise on the local network with mDNS, and the controller discovers workers and distributes Slurm configuration over SSH.
+- **Shared storage:** The controller exports `/cluster` over NFSv4; workers mount it for shared `projects`, `data`, `results`, and `software` directories.
+- **Cluster time service:** Chrony keeps worker clocks aligned with the controller, which can use an upstream time source or provide a local fallback.
+- **Hardware-aware Slurm configuration:** CPU topology is detected, and NVIDIA GPU or Hailo accelerator resources can be represented in Slurm. Driver installation and accelerator workloads require hardware-specific setup and testing.
+- **Interactive and batch scheduling:** Run commands across nodes with `srun` and submit multi-node jobs with `sbatch`.
+- **Recovery behavior:** The QEMU qualification exercises worker reboot and address refresh, plus controller reboot recovery for Slurm, NFS, and chrony.
+- **Pre-deployment QEMU qualification:** Test image provisioning, enrollment, shared storage, and scheduling on a private virtual network before writing images to USB. Physical USB boot and real-LAN behavior remain to be qualified.
 
 ## Generic manifest-driven workflow
 
@@ -121,7 +141,7 @@ The controller setup script rewrites its two-node configuration, and the current
 
 ## Legacy Dell-specific physical profile
 
-The tested compute node exposes its CPU, NVIDIA GPU, and ASUS Hailo-10H AI accelerator to Slurm jobs. The Hailo-10H is sometimes called a TPU here, but it is a Hailo AI accelerator with a software stack distinct from NVIDIA CUDA. For this hardware, Windows did not provide a usable driver/runtime path and WSL could not see the PCIe device, so the node boots native Debian Linux from USB, where the kernel driver, firmware, and HailoRT can access it.
+The tested compute node exposes its CPU, NVIDIA GPU, and ASUS Hailo-10H AI accelerator to Slurm jobs. The Hailo-10H is sometimes called a TPU here, but it is a Hailo AI accelerator with a software stack distinct from NVIDIA CUDA. On the Dell 7680 setup that motivated this project, the Hailo Windows driver refused to install and WSL could not see the PCIe device. Booting native Debian Linux from USB gave the kernel driver, firmware, and HailoRT direct access to it.
 
 
 | Host | Address | Role | Slurm resources |
@@ -317,4 +337,4 @@ The ISO builder follows the SynthOS remaster pattern: start from an official Deb
 
 The generic first-boot images use the same provisioning login and password, passwordless sudo, and SSH password authentication to support enrollment. Keep first boot and enrollment on the trusted cluster LAN. Before exposing nodes to other networks, confirm key-based access, change the shared bootstrap password, and disable SSH password authentication where appropriate. Review sudo policy before production use.
 
-This repository does not include a `LICENSE` file. Choose and add a license before publishing it as an open-source GitHub project.
+The original code and documentation in this repository are available under the MIT License; third-party packages and components retain their own licenses.
