@@ -177,7 +177,6 @@ service = pathlib.Path(root, "systemd/guerrilla-node-advertise.service").read_te
 admin = pathlib.Path(root, "scripts/guerrilla-cluster-admin").read_text()
 generator = pathlib.Path(root, "scripts/generate-slurm-config.py").read_text()
 remote_installer = pathlib.Path(root, "scripts/install-enrolled-slurm-node").read_text()
-backup_script = pathlib.Path(root, "scripts/backup-guerrilla-controller.sh").read_text()
 identity = json.dumps({
     "cluster_id": cluster,
     "node_id": node,
@@ -227,12 +226,6 @@ config["runcmd"].append([
     "/bin/bash", "-lc",
     "for tool in " + " ".join(required_tools) + "; do command -v \"$tool\" >/dev/null || exit 1; done; slurmd -C >/dev/null",
 ])
-if role == "controller":
-    config["write_files"].append({
-        "path": "/usr/local/sbin/guerrilla-backup-controller",
-        "permissions": "0750",
-        "content": backup_script,
-    })
 pathlib.Path(user_data).write_text("#cloud-config\n" + json.dumps(config, indent=2) + "\n")
 pathlib.Path(meta_data).write_text(
     f"instance-id: guerrilla-{cluster}-{node}\nlocal-hostname: {hostname}\n"
